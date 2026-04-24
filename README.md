@@ -1,61 +1,102 @@
-# 🚆 RailSaathi — Custom Generative SLM
+# RailSaathi
 
-A custom-built **Generative Small Language Model (SLM)** for Indian Railways queries. Instead of an intent classifier, RailSaathi is now powered by a **Causal Transformer Decoder (Mini-GPT)** built from scratch using TensorFlow/Keras. It autoregressively generates responses word-by-word and dynamically intercepts database calls to answer your queries naturally.
+RailSaathi is a **micro language model for Indian Railways policy and rules**.  
+It trains a compact causal decoder (Mini-GPT style) on a synthetic railway-policy corpus and serves answers via CLI or Streamlit.
 
-## Features
+## Why This Project
 
-- **Generative NLU**: No hardcoded if/else routing. The model understands context and speaks naturally.
-- **Top-K & Temperature Sampling**: Ensures creative, varied, and human-like conversational responses.
-- **Dialogue State Tracking (Memory)**: The bot remembers context (like your source station) across multiple messages.
-- **Train Info** — Look up any train by number (e.g. *tell me about train 12301*)
-- **Route Search** — Find trains between two stations (e.g. *trains from Mumbai to Pune*)
-- **Running Days** — Check which days a train operates (e.g. *what days from Delhi to Chennai*)
+- Build a lightweight model that can train on CPU in minutes.
+- Keep responses focused on railway policy domains.
+- Reduce gibberish by combining a compact causal LM with retrieval guardrails over `railway_data.txt`.
 
-## Setup (Using `uv`)
+## Current Status
 
-We use [`uv`](https://github.com/astral-sh/uv) because it is incredibly fast for creating virtual environments and installing Python packages.
+- `railway_data.txt`: 10,000 unique synthetic policy lines.
+- `generative_data.json`: conversational training examples generated from those rules.
+- Micro model: 2-layer causal decoder (`embed_dim=128`, `num_heads=4`).
+- Typical training time on CPU-only setup: ~4-6 minutes for 4 epochs.
+- CLI retrieval layer includes token normalization, synonym expansion, weighted scoring, and output cleanup for stronger policy matching.
 
-### 1. Install `uv` (if you don't have it)
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+## Tech Stack
+
+- Python 3.11+
+- TensorFlow / Keras
+- NumPy, Pandas
+- Streamlit
+
+## Project Structure
+
+```text
+app.py                    # Streamlit app (chat UI + policy retrieval + optional train lookup flow)
+cli.py                    # Terminal chat interface for policy Q&A
+augment_railway_data.py   # Builds realistic synthetic railway policy corpus (10k+ lines)
+generate_data.py          # Converts rules into conversational [USER]/[BOT] samples
+train_mlm.py              # Training pipeline (vectorization, masking, callbacks, saving artifacts)
+mlm_model.py              # Micro causal decoder architecture
+railway_data.txt          # Policy corpus used as base knowledge + retrieval index
+generative_data.json      # Training dataset generated from railway_data.txt
+mlm_vocab.pkl             # Saved vocabulary + model metadata
+mlm_weights.weights.h5    # Trained model weights
+requirements.txt          # Dependencies
 ```
 
-### 2. Setup Project & Install Dependencies
-Make sure you are in the `RailSaathi` directory:
+## Setup
+
 ```bash
-cd RailSaathi
-uv venv
+python3 -m venv .venv
 source .venv/bin/activate
-uv pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-### 3. Generate Data & Train the SLM
-Since this is a custom model built from scratch, you need to generate the synthetic training data and train the weights locally.
+## Training Pipeline
+
+Run end-to-end:
 
 ```bash
-uv run generate_data.py
-uv run train_mlm.py
+python3 augment_railway_data.py --target 10000
+python3 generate_data.py
+python3 train_mlm.py --epochs 4 --batch-size 128 --vocab-size 6000 --max-len 48
 ```
-*(Note: Training the 4-layer generative model on 62,000 sequences will take a few minutes).*
 
-### 4. Run the App
+Artifacts produced/updated:
+
+- `railway_data.txt`
+- `generative_data.json`
+- `mlm_vocab.pkl`
+- `mlm_weights.weights.h5`
+
+## Run
+
+CLI:
+
 ```bash
-uv run streamlit run app.py
+python3 cli.py
 ```
 
-The app will open at `http://localhost:8501`.
+Streamlit UI:
 
-## Architecture
+```bash
+streamlit run app.py
+```
 
-```
-app.py                  # Streamlit app + Autoregressive Generation Loop
-mlm_model.py            # Causal Transformer Decoder Architecture (Mini-GPT)
-generate_data.py        # Generates 62k+ diverse conversational training sequences
-train_mlm.py            # Next-Token Prediction Training pipeline
-requirements.txt        # Dependencies
-train_info.csv          # Railway dataset (~11K train entries)
-```
+## Notes on Accuracy and Stability
+
+- The model is strongest for in-domain policy questions: waiting list, tatkal, refunds, baggage, berth, fines, complaint channels.
+- `cli.py` uses an enhanced retrieval-first matcher (weighted token scoring + normalization), which is the most stable mode for policy Q&A.
+- `app.py` also uses retrieval-first matching, but its scoring logic is currently simpler than CLI.
+- For ambiguous or multi-intent questions, ask users to provide one clear query at a time for best results.
+
+## Optional Data Requirement for App Train Lookup Mode
+
+`app.py` also contains optional train route/day/info parsing logic that expects `train_info.csv`.  
+If you only need policy-mode micro-LM behavior, `cli.py` is sufficient.
+
+## Roadmap
+
+- Add offline evaluation script for exact-match / semantic-match policy QA scoring.
+- Add confusion and failure-case reports per topic.
+- Add incremental fine-tuning on real user queries.
 
 ## License
 
-This project is open source. See the repository for details.
+Add your license here (MIT/Apache-2.0/etc.).

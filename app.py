@@ -17,6 +17,27 @@ from mlm_model import build_causal_mlm
 st.set_page_config(page_title="Railway Query Assistant", page_icon="🚆", layout="centered")
 
 BASE_DIR = Path(__file__).resolve().parent
+STOPWORDS = {
+    "what", "is", "the", "a", "an", "for", "to", "of", "in", "on", "with", "and",
+    "can", "i", "me", "my", "about", "policy", "rule", "please", "tell", "how",
+    "do", "does", "if", "who", "from", "by", "as", "per",
+}
+DISPLAY_PREFIXES = [
+    "railway guideline states that ",
+    "according to railway policy ",
+    "as per indian railways rules ",
+    "under current railway norms ",
+    "in indian railways operations ",
+    "official railway instructions mention that ",
+    "for passenger guidance railway rules say ",
+    "as per reservation manual ",
+    "as per ticketing policy ",
+    "railway administration clarifies that ",
+    "for train travel compliance ",
+    "under railway passenger charter ",
+    "as per official railway advisory ",
+    "under standard operating railway rules ",
+]
 
 # =============================
 # Load Assets & Generative MLM
@@ -44,6 +65,7 @@ def load_assets():
         meta = pickle.load(f)
         
     vocab = meta["vocab"]
+    max_len = int(meta.get("max_len", 48))
     id_to_word = {i: w for i, w in enumerate(vocab)}
     
     # 3. Setup Vectorizer
@@ -53,20 +75,27 @@ def load_assets():
 
     vectorizer = TextVectorization(
         max_tokens=len(vocab), 
-        output_sequence_length=48,
+        output_sequence_length=max_len,
         standardize=custom_standardization
     )
     vectorizer.set_vocabulary(vocab)
     
     # 4. Load Generative Causal MLM Weights
-    model = build_causal_mlm(vocab_size=len(vocab), max_len=48)
-    model(tf.zeros((1, 48), dtype=tf.int32)) # Build graph
+    model = build_causal_mlm(vocab_size=len(vocab), max_len=max_len)
+    model(tf.zeros((1, max_len), dtype=tf.int32)) # Build graph
     model.load_weights(str(BASE_DIR / "mlm_weights.weights.h5"))
     
-    return df, vectorizer, model, id_to_word
+    rules = [line.strip().lower() for line in (BASE_DIR / "railway_data.txt").read_text(encoding="utf-8").splitlines() if line.strip()]
+    rule_index = []
+    for rule in rules:
+        tokens = set(re.findall(r"[a-z0-9]+", rule)) - STOPWORDS
+        if tokens:
+            rule_index.append((rule, tokens))
+
+    return df, vectorizer, model, id_to_word, max_len, rule_index
 
 try:
-    df, vectorizer, mlm_model, id_to_word = load_assets()
+    df, vectorizer, mlm_model, id_to_word, max_len, rule_index = load_assets()
     model_loaded = True
 except Exception as e:
     st.error(f"Error loading Generative MLM. Please run `python generate_data.py` then `python train_mlm.py`. Error: {e}")
@@ -75,9 +104,60 @@ except Exception as e:
 # =============================
 # Autoregressive Generation
 # =============================
-def generate_response(query, temperature=0.7, top_k=5):
+def retrieve_rule(query):
+    q_tokens = set(re.findall(r"[a-z0-9]+", query.lower())) - STOPWORDS
+    if not q_tokens:
+        return None
+
+    best_rule = None
+    best_score = 0.0
+    for rule, tokens in rule_index:
+        overlap = len(q_tokens & tokens)
+        if overlap == 0:
+            continue
+        precision = overlap / len(q_tokens)
+        recall = overlap / len(tokens)
+        score = 0.75 * precision + 0.25 * recall
+        if q_tokens.issubset(tokens):
+            score += 0.1
+        if score > best_score:
+            best_score = score
+            best_rule = rule
+    if best_score >= 0.50:
+        return best_rule
+    return None
+
+
+def clean_rule_for_output(rule: str) -> str:
+    text = rule.strip()
+    changed = True
+    while changed:
+        changed = False
+        for prefix in DISPLAY_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                changed = True
+    return text
+
+
+def format_policy_text(text: str) -> str:
+    body = text.strip().lower()
+    if body.startswith("railway guideline:"):
+        body = body.split(":", 1)[1].strip()
+    body = clean_rule_for_output(body)
+    body = re.sub(r"\s+", " ", body).strip()
+    if not body:
+        return "please share your railway question in detail"
+    return f"railway guideline: {body}"
+
+
+def generate_response(query, temperature=0.3, top_k=1):
     """Feeds prompt to the Causal LM and generates token-by-token until [end].
     Uses Temperature and Top-K sampling for natural variance."""
+    retrieved = retrieve_rule(query)
+    if retrieved:
+        return format_policy_text(retrieved)
+
     prompt = f"[user] {query} [bot]"
     
     # Convert prompt to token IDs
@@ -87,18 +167,26 @@ def generate_response(query, temperature=0.7, top_k=5):
     input_ids = [tid for tid in input_tensor_full if tid > 1]
     
     # Re-pad to MAX_LEN
-    input_tensor = np.zeros(48, dtype=np.int32)
-    for i, tid in enumerate(input_ids[:48]):
+    input_tensor = np.zeros(max_len, dtype=np.int32)
+    for i, tid in enumerate(input_ids[:max_len]):
         input_tensor[i] = tid
         
     current_len = len(input_ids)
-    if current_len > 48: current_len = 48
+    if current_len > max_len:
+        current_len = max_len
+    if current_len == 0:
+        return "please share your railway question in detail"
             
     generated_tokens = []
     repetition_penalty = 1.2
+    blocked_tokens = {0, 1}
+    for tag in ["[user]", "[bot]"]:
+        tag_id = [k for k, v in id_to_word.items() if v == tag]
+        if tag_id:
+            blocked_tokens.add(tag_id[0])
     
     # Autoregressive loop
-    for _ in range(48 - current_len):
+    for _ in range(max_len - current_len):
         # Predict next token probabilities
         preds = mlm_model.predict(np.array([input_tensor]), verbose=0)
         logits = np.log(preds[0, current_len - 1, :] + 1e-10) # convert to logits
@@ -114,10 +202,9 @@ def generate_response(query, temperature=0.7, top_k=5):
                 else:
                     logits[token_id] *= repetition_penalty
         
-        # Never generate [user] or [bot] tags in the response
-        for tag in ["[user]", "[bot]"]:
-            tag_id = [k for k, v in id_to_word.items() if v == tag]
-            if tag_id: logits[tag_id[0]] = -1e10
+        # Never generate control or unknown tokens.
+        for token_id in blocked_tokens:
+            logits[token_id] = -1e10
 
         # Top-K Sampling
         top_indices = np.argsort(logits)[-top_k:]
@@ -135,7 +222,14 @@ def generate_response(query, temperature=0.7, top_k=5):
         input_tensor[current_len] = next_token_id
         current_len += 1
         
-    return " ".join(generated_tokens)
+    raw = " ".join(generated_tokens).strip()
+    if not raw:
+        return "please share your railway question in detail"
+
+    lowered = raw.lower()
+    if lowered.startswith("railway guideline:") or any(lowered.startswith(prefix) for prefix in DISPLAY_PREFIXES):
+        return format_policy_text(raw)
+    return raw
 
 # =============================
 # Action Execution (RAG / DB Lookup)
